@@ -1,21 +1,16 @@
+'use strict';
+
 /**
- * WebRTC Signaling Server for Parental Control Screen & Audio Mirroring.
- *
- * Supports:
- * - START_SCREEN, STOP_SCREEN
- * - START_AUDIO, STOP_AUDIO
- * - WEBRTC_OFFER, WEBRTC_ANSWER
- * - ICE_CANDIDATE
- * - RESTART_ICE
- * - FORCE_RELAY_MODE
- * - HEARTBEAT, reconnect, and acknowledgement
- *
- * Routing key:
- *   pairingId, sessionId, negotiationId, senderDeviceId, targetDeviceId, messageId
+ * ParentGuard backend:
+ * - Existing WebRTC WebSocket signaling remains compatible.
+ * - Secure Firebase-authenticated HTTP APIs manage trials, plans and bans.
+ * - Supabase stores users, subscriptions and audit logs.
  */
 
 const http = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
+const { handleApi, sendJson } = require('./lib/api');
+const { platformHealth } = require('./lib/platform');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -26,32 +21,42 @@ const clients = new Map();
 // Reverse map: WebSocket connection -> Set<deviceId>
 const socketToDevices = new WeakMap();
 
-// HTTP server for health checks & WebSocket upgrades
-const server = http.createServer((req, res) => {
-  if (req.url === '/health' || req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'ok',
-      activeDevices: clients.size,
-      uptimeSec: Math.floor(process.uptime()),
-      timestamp: Date.now()
-    }));
-    return;
+const server = http.createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+
+    if ((req.method === 'GET' && url.pathname === '/health') ||
+        (req.method === 'GET' && url.pathname === '/')) {
+      const platform = await platformHealth();
+      sendJson(res, 200, {
+        status: 'ok',
+        activeDevices: clients.size,
+        uptimeSec: Math.floor(process.uptime()),
+        timestamp: Date.now(),
+        platform
+      });
+      return;
+    }
+
+    const handled = await handleApi(req, res, url);
+    if (!handled) sendJson(res, 404, { ok: false, error: 'Not Found' });
+  } catch (error) {
+    console.error('[HTTPServer] Unhandled request error:', error);
+    if (!res.headersSent) sendJson(res, 500, { ok: false, error: 'Server request failed' });
+    else res.end();
   }
-  res.writeHead(404);
-  res.end('Not Found');
 });
 
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
-  // Allow all paths or /ws
+  // Existing Android apps connect to /ws. Keep backward compatibility.
   wss.handleUpgrade(request, socket, head, (ws) => {
     wss.emit('connection', ws, request);
   });
 });
 
-wss.on('connection', (ws, req) => {
+wss.on('connection', (ws) => {
   ws.isAlive = true;
   socketToDevices.set(ws, new Set());
 
@@ -63,11 +68,9 @@ wss.on('connection', (ws, req) => {
     try {
       const text = raw.toString('utf8').trim();
       if (!text) return;
-      const data = JSON.parse(text);
-
-      handleIncomingMessage(ws, data);
-    } catch (err) {
-      console.error('[SignalingServer] Malformed message error:', err.message);
+      handleIncomingMessage(ws, JSON.parse(text));
+    } catch (error) {
+      console.error('[SignalingServer] Malformed message error:', error.message);
       safeSend(ws, {
         type: 'ERROR',
         error: 'Malformed JSON message',
@@ -76,13 +79,10 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  ws.on('close', (code, reason) => {
-    cleanupSocket(ws, `code=${code}`);
-  });
-
-  ws.on('error', (err) => {
-    console.warn('[SignalingServer] Socket error:', err.message);
-    cleanupSocket(ws, `error=${err.message}`);
+  ws.on('close', (code) => cleanupSocket(ws, `code=${code}`));
+  ws.on('error', (error) => {
+    console.warn('[SignalingServer] Socket error:', error.message);
+    cleanupSocket(ws, `error=${error.message}`);
   });
 });
 
@@ -93,7 +93,9 @@ function handleIncomingMessage(ws, msg) {
     return;
   }
 
-  // 1. Device Registration / Auth / Join
+  // Existing device registration stays compatible with the current apps.
+  // Firebase-token enforcement for WebSocket registration should be enabled
+  // only after both Parent and Child apps send tokens during REGISTER.
   if (type === 'REGISTER' || type === 'DEVICE_ONLINE') {
     const deviceId = msg.deviceId || msg.senderDeviceId;
     if (!deviceId) {
@@ -103,20 +105,16 @@ function handleIncomingMessage(ws, msg) {
 
     const previousWs = clients.get(deviceId);
     if (previousWs && previousWs !== ws) {
-      console.log(`[SignalingServer] Device ${deviceId} reconnecting from new connection. Closing previous.`);
-      try {
-        previousWs.close(1000, 'Replaced by new connection');
-      } catch (_) {}
+      console.log(`[SignalingServer] Device ${deviceId} reconnecting. Closing previous connection.`);
+      try { previousWs.close(1000, 'Replaced by new connection'); } catch (_) {}
     }
 
     clients.set(deviceId, ws);
-    const set = socketToDevices.get(ws) || new Set();
-    set.add(deviceId);
-    socketToDevices.set(ws, set);
+    const registered = socketToDevices.get(ws) || new Set();
+    registered.add(deviceId);
+    socketToDevices.set(ws, registered);
 
     console.log(`[SignalingServer] Device registered: ${deviceId} (Total active: ${clients.size})`);
-
-    // Acknowledge registration
     safeSend(ws, {
       type: 'REGISTERED',
       deviceId,
@@ -126,7 +124,6 @@ function handleIncomingMessage(ws, msg) {
     return;
   }
 
-  // 2. Heartbeat Ping / Pong
   if (type === 'HEARTBEAT' || type === 'PING') {
     ws.isAlive = true;
     safeSend(ws, {
@@ -137,9 +134,6 @@ function handleIncomingMessage(ws, msg) {
     return;
   }
 
-  // 3. Routed Signaling Messages:
-  // START_SCREEN, STOP_SCREEN, START_AUDIO, STOP_AUDIO,
-  // WEBRTC_OFFER, WEBRTC_ANSWER, ICE_CANDIDATE, RESTART_ICE, FORCE_RELAY_MODE, etc.
   const {
     pairingId = '',
     sessionId = '',
@@ -162,7 +156,6 @@ function handleIncomingMessage(ws, msg) {
   }
 
   const targetWs = clients.get(targetDeviceId);
-
   if (!targetWs || targetWs.readyState !== WebSocket.OPEN) {
     console.log(`[SignalingServer] Target ${targetDeviceId} offline for ${type} (msgId=${messageId})`);
     safeSend(ws, {
@@ -174,8 +167,7 @@ function handleIncomingMessage(ws, msg) {
     return;
   }
 
-  // Envelope forwarded to target
-  const forwardedMessage = {
+  safeSend(targetWs, {
     type,
     messageType: type,
     pairingId,
@@ -186,11 +178,8 @@ function handleIncomingMessage(ws, msg) {
     messageId,
     payload,
     timestamp: msg.timestamp || Date.now()
-  };
+  });
 
-  safeSend(targetWs, forwardedMessage);
-
-  // Send ACK back to sender confirming server receipt and forwarding
   if (messageId) {
     safeSend(ws, {
       type: 'ACK',
@@ -203,45 +192,46 @@ function handleIncomingMessage(ws, msg) {
   console.log(`[SignalingServer] Forwarded ${type} from ${senderDeviceId} -> ${targetDeviceId} [negId=${negotiationId || '-'}]`);
 }
 
-function safeSend(ws, obj) {
+function safeSend(ws, object) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     try {
-      ws.send(JSON.stringify(obj));
-    } catch (e) {
-      console.error('[SignalingServer] Error sending payload:', e.message);
+      ws.send(JSON.stringify(object));
+    } catch (error) {
+      console.error('[SignalingServer] Error sending payload:', error.message);
     }
   }
 }
 
 function cleanupSocket(ws, reason) {
   const registered = socketToDevices.get(ws);
-  if (registered) {
-    for (const devId of registered) {
-      if (clients.get(devId) === ws) {
-        clients.delete(devId);
-        console.log(`[SignalingServer] Cleaned up device ${devId} (${reason}). Remaining active: ${clients.size}`);
-      }
+  if (!registered) return;
+
+  for (const deviceId of registered) {
+    if (clients.get(deviceId) === ws) {
+      clients.delete(deviceId);
+      console.log(`[SignalingServer] Cleaned up device ${deviceId} (${reason}). Remaining: ${clients.size}`);
     }
-    registered.clear();
   }
+  registered.clear();
 }
 
-// Keep-alive heartbeat sweep
-const interval = setInterval(() => {
+const heartbeatInterval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) {
-      console.log('[SignalingServer] Terminating dead client connection (missed ping/pong)');
-      return ws.terminate();
+      console.log('[SignalingServer] Terminating dead client connection');
+      ws.terminate();
+      return;
     }
     ws.isAlive = false;
     ws.ping();
   });
 }, PING_INTERVAL_MS);
 
-wss.on('close', () => {
-  clearInterval(interval);
-});
+wss.on('close', () => clearInterval(heartbeatInterval));
 
 server.listen(PORT, HOST, () => {
-  console.log(`[SignalingServer] WebRTC signaling WebSocket server running on http://${HOST}:${PORT} (ws://${HOST}:${PORT}/ws)`);
+  console.log(`[ParentGuard] HTTP API listening on http://${HOST}:${PORT}`);
+  console.log(`[ParentGuard] WebSocket signaling listening on ws://${HOST}:${PORT}/ws`);
+  console.log(`[ParentGuard] Supabase configured: ${Boolean(process.env.SUPABASE_URL && (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY))}`);
+  console.log(`[ParentGuard] Firebase Admin configured: ${Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY))}`);
 });
