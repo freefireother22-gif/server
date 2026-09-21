@@ -10,7 +10,6 @@
 const http = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
 const { handleApi, sendJson } = require('./lib/api');
-const { platformHealth } = require('./lib/platform');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -27,14 +26,9 @@ const server = http.createServer(async (req, res) => {
 
     if ((req.method === 'GET' && url.pathname === '/health') ||
         (req.method === 'GET' && url.pathname === '/')) {
-      const platform = await platformHealth();
-      sendJson(res, 200, {
-        status: 'ok',
-        activeDevices: clients.size,
-        uptimeSec: Math.floor(process.uptime()),
-        timestamp: Date.now(),
-        platform
-      });
+      // Keep the public health response minimal. Detailed platform diagnostics
+      // must not disclose database or Firebase configuration to the internet.
+      sendJson(res, 200, { status: 'ok' });
       return;
     }
 

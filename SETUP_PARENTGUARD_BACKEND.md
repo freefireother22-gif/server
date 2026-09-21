@@ -31,12 +31,8 @@ Never commit real secret values to GitHub.
 1. Replace the repository files with this package.
 2. Commit and push to the same GitHub branch used by Render.
 3. Render runs `npm install` and `npm start` automatically.
-4. Open `https://YOUR-RENDER-SERVICE/health`.
-5. Confirm:
-   - `status` = `ok`
-   - `platform.supabaseConfigured` = `true`
-   - `platform.databaseReachable` = `true`
-   - `platform.firebaseAdminConfigured` = `true` after adding Firebase Admin values.
+4. Open `https://YOUR-RENDER-SERVICE/health`. It should return only `{"status":"ok"}` publicly.
+5. Check detailed platform diagnostics only through an authenticated admin/operations route; do not expose database or Firebase configuration on the public health endpoint.
 
 ## Approve the first Admin
 After choosing the Gmail address for the Admin Panel, run in Supabase SQL Editor:
