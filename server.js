@@ -44,7 +44,12 @@ const server = http.createServer(async (req, res) => {
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
-  // Existing Android apps connect to /ws. Keep backward compatibility.
+  const upgradeUrl = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+  if (upgradeUrl.pathname !== '/ws') {
+    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+    socket.destroy();
+    return;
+  }
   wss.handleUpgrade(request, socket, head, (ws) => {
     wss.emit('connection', ws, request);
   });
@@ -137,6 +142,18 @@ function handleIncomingMessage(ws, msg) {
     messageId = '',
     payload = ''
   } = msg;
+
+  const registeredDevices = socketToDevices.get(ws) || new Set();
+  if (!senderDeviceId || !registeredDevices.has(senderDeviceId)) {
+    console.warn(`[SignalingServer] Rejected ${type}: senderDeviceId is not registered on this socket`);
+    safeSend(ws, {
+      type: 'ERROR',
+      error: 'Sender device is not registered on this socket',
+      messageId,
+      timestamp: Date.now()
+    });
+    return;
+  }
 
   if (!targetDeviceId) {
     console.warn(`[SignalingServer] Message ${type} rejected: missing targetDeviceId from ${senderDeviceId}`);
