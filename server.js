@@ -10,6 +10,8 @@
 const http = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
 const { handleApi, sendJson } = require('./lib/api');
+const { getSupabase, verifyFirebaseBearer } = require('./lib/platform');
+const { requireFeature } = require('./lib/entitlements');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -19,6 +21,7 @@ const PING_INTERVAL_MS = 25000;
 const clients = new Map();
 // Reverse map: WebSocket connection -> Set<deviceId>
 const socketToDevices = new WeakMap();
+const socketDeviceAuth = new WeakMap();
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -58,24 +61,25 @@ server.on('upgrade', (request, socket, head) => {
 wss.on('connection', (ws) => {
   ws.isAlive = true;
   socketToDevices.set(ws, new Set());
+  socketDeviceAuth.set(ws, new Map());
 
   ws.on('pong', () => {
     ws.isAlive = true;
   });
 
   ws.on('message', (raw) => {
-    try {
+    Promise.resolve().then(async () => {
       const text = raw.toString('utf8').trim();
       if (!text) return;
-      handleIncomingMessage(ws, JSON.parse(text));
-    } catch (error) {
-      console.error('[SignalingServer] Malformed message error:', error.message);
+      await handleIncomingMessage(ws, JSON.parse(text));
+    }).catch((error) => {
+      console.error('[SignalingServer] Message error:', error.message);
       safeSend(ws, {
         type: 'ERROR',
-        error: 'Malformed JSON message',
+        error: error.statusCode ? error.message : 'Malformed JSON message',
         timestamp: Date.now()
       });
-    }
+    });
   });
 
   ws.on('close', (code) => cleanupSocket(ws, `code=${code}`));
@@ -85,22 +89,61 @@ wss.on('connection', (ws) => {
   });
 });
 
-function handleIncomingMessage(ws, msg) {
+async function authenticateDevice(deviceId, firebaseToken) {
+  if (!firebaseToken) {
+    const error = new Error('Firebase authentication is required for signaling');
+    error.statusCode = 401;
+    throw error;
+  }
+  const decoded = await verifyFirebaseBearer(`Bearer ${firebaseToken}`);
+  const { data: device, error: deviceError } = await getSupabase()
+    .from('device_registry')
+    .select('*')
+    .eq('device_id', deviceId)
+    .eq('firebase_uid', decoded.uid)
+    .maybeSingle();
+  if (deviceError) throw new Error(`Device authentication lookup failed: ${deviceError.message}`);
+  if (!device) {
+    const error = new Error('Device is not registered for this Firebase account');
+    error.statusCode = 403;
+    throw error;
+  }
+
+  let ownerUid = device.role === 'parent' ? decoded.uid : device.owner_firebase_uid;
+  if (device.role === 'child' && !ownerUid && device.pairing_id) {
+    const parent = await getSupabase()
+      .from('device_registry')
+      .select('firebase_uid, owner_firebase_uid')
+      .eq('pairing_id', device.pairing_id)
+      .eq('role', 'parent')
+      .maybeSingle();
+    if (!parent.error && parent.data) {
+      ownerUid = parent.data.owner_firebase_uid || parent.data.firebase_uid;
+    }
+  }
+  if (!ownerUid) {
+    const error = new Error('Device has no verified parent subscription owner');
+    error.statusCode = 403;
+    throw error;
+  }
+  await requireFeature(ownerUid, 'PARENTAL_CONTROL');
+  return { uid: decoded.uid, ownerUid, device };
+}
+
+async function handleIncomingMessage(ws, msg) {
   const type = msg.type || msg.messageType;
   if (!type) {
     safeSend(ws, { type: 'ERROR', error: 'Missing message type', timestamp: Date.now() });
     return;
   }
 
-  // Existing device registration stays compatible with the current apps.
-  // Firebase-token enforcement for WebSocket registration should be enabled
-  // only after both Parent and Child apps send tokens during REGISTER.
   if (type === 'REGISTER' || type === 'DEVICE_ONLINE') {
     const deviceId = msg.deviceId || msg.senderDeviceId;
     if (!deviceId) {
       safeSend(ws, { type: 'ERROR', error: 'Missing deviceId in register', timestamp: Date.now() });
       return;
     }
+    const auth = await authenticateDevice(deviceId, msg.firebaseToken);
 
     const previousWs = clients.get(deviceId);
     if (previousWs && previousWs !== ws) {
@@ -112,6 +155,7 @@ function handleIncomingMessage(ws, msg) {
     const registered = socketToDevices.get(ws) || new Set();
     registered.add(deviceId);
     socketToDevices.set(ws, registered);
+    socketDeviceAuth.get(ws).set(deviceId, auth);
 
     console.log(`[SignalingServer] Device registered: ${deviceId} (Total active: ${clients.size})`);
     safeSend(ws, {
@@ -144,6 +188,7 @@ function handleIncomingMessage(ws, msg) {
   } = msg;
 
   const registeredDevices = socketToDevices.get(ws) || new Set();
+  const authenticated = socketDeviceAuth.get(ws)?.get(senderDeviceId);
   if (!senderDeviceId || !registeredDevices.has(senderDeviceId)) {
     console.warn(`[SignalingServer] Rejected ${type}: senderDeviceId is not registered on this socket`);
     safeSend(ws, {
@@ -152,6 +197,10 @@ function handleIncomingMessage(ws, msg) {
       messageId,
       timestamp: Date.now()
     });
+    return;
+  }
+  if (!authenticated) {
+    safeSend(ws, { type: 'ERROR', error: 'Signaling authentication is required', messageId, timestamp: Date.now() });
     return;
   }
 
@@ -176,6 +225,43 @@ function handleIncomingMessage(ws, msg) {
       timestamp: Date.now()
     });
     return;
+  }
+  const targetAuth = socketDeviceAuth.get(targetWs)?.get(targetDeviceId);
+  const senderDevice = authenticated.device;
+  const targetDevice = targetAuth?.device;
+  if (!targetDevice || !senderDevice.pairing_id || !targetDevice.pairing_id ||
+      (pairingId && senderDevice.pairing_id !== pairingId) ||
+      senderDevice.pairing_id !== targetDevice.pairing_id) {
+    safeSend(ws, {
+      type: 'ERROR',
+      error: 'Sender and target devices are not in the same verified pairing',
+      messageId,
+      timestamp: Date.now()
+    });
+    return;
+  }
+
+  const requiredFeature = {
+    START_SCREEN: 'SCREEN_MIRRORING',
+    START_CAMERA: 'REMOTE_CAMERA',
+    START_AUDIO: 'ONE_WAY_AUDIO',
+    APP_BLOCK_RULES_UPDATE: 'APP_LOCKING',
+    MONITORING_SNAPSHOT: 'PARENTAL_CONTROL',
+    MONITORING_LOCATION: 'LIVE_LOCATION'
+  }[type];
+  if (requiredFeature) {
+    try {
+      await requireFeature(authenticated.ownerUid, requiredFeature);
+    } catch (error) {
+      safeSend(ws, {
+        type: 'ERROR',
+        error: error.message,
+        code: error.code || 'PAID_PLAN_REQUIRED',
+        messageId,
+        timestamp: Date.now()
+      });
+      return;
+    }
   }
 
   safeSend(targetWs, {
@@ -224,6 +310,7 @@ function cleanupSocket(ws, reason) {
     }
   }
   registered.clear();
+  socketDeviceAuth.delete(ws);
 }
 
 const heartbeatInterval = setInterval(() => {
