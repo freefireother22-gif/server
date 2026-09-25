@@ -89,7 +89,7 @@ wss.on('connection', (ws) => {
   });
 });
 
-async function authenticateDevice(deviceId, firebaseToken) {
+async function authenticateDevice(deviceId, firebaseToken, options = {}) {
   if (!firebaseToken) {
     const error = new Error('Firebase authentication is required for signaling');
     error.statusCode = 401;
@@ -126,7 +126,7 @@ async function authenticateDevice(deviceId, firebaseToken) {
     // already registered under its anonymous Firebase UID, but it cannot
     // have owner_firebase_uid/pairing_id until the Parent accepts the OTP.
     // Allow only the PAIR_ACCEPTED handshake in this pre-pairing state.
-    if (device.role === 'child' && !device.pairing_id) {
+    if (device.role === 'child' && (options.allowPrePairing === true || !device.pairing_id)) {
       return { uid: decoded.uid, ownerUid: null, prePairing: true, device };
     }
     const error = new Error('Device has no verified parent subscription owner');
@@ -150,7 +150,10 @@ async function handleIncomingMessage(ws, msg) {
       safeSend(ws, { type: 'ERROR', error: 'Missing deviceId in register', timestamp: Date.now() });
       return;
     }
-    const auth = await authenticateDevice(deviceId, msg.firebaseToken);
+    // A Child may still have a stale pairing_id from an earlier install or
+    // unbind. Registration must be allowed so the new PAIR_ACCEPTED handshake
+    // can establish the verified owner again.
+    const auth = await authenticateDevice(deviceId, msg.firebaseToken, { allowPrePairing: true });
 
     const previousWs = clients.get(deviceId);
     if (previousWs && previousWs !== ws) {
@@ -241,6 +244,46 @@ async function handleIncomingMessage(ws, msg) {
     authenticated.prePairing === true &&
     senderDevice.role === 'child' &&
     targetDevice?.role === 'parent';
+  if (isPairAcceptedHandshake) {
+    if (!pairingId) {
+      safeSend(ws, {
+        type: 'ERROR',
+        error: 'PAIR_ACCEPTED requires a pairingId',
+        messageId,
+        timestamp: Date.now()
+      });
+      return;
+    }
+    // The Child is initially registered with its anonymous Firebase account.
+    // At the moment of acceptance, the connected Parent is the trusted source
+    // of the subscription owner and pairing relationship.
+    await requireFeature(targetAuth.ownerUid, 'PARENTAL_CONTROL');
+    const { data: pairedDevice, error: pairingError } = await getSupabase()
+      .from('device_registry')
+      .update({
+        pairing_id: pairingId,
+        owner_firebase_uid: targetAuth.ownerUid,
+        role: 'child',
+        last_seen_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
+      .eq('device_id', senderDeviceId)
+      .select('*')
+      .maybeSingle();
+    if (pairingError) throw new Error(`Unable to finalize child pairing: ${pairingError.message}`);
+    if (!pairedDevice) {
+      safeSend(ws, {
+        type: 'ERROR',
+        error: 'Child device is not registered in the device registry',
+        messageId,
+        timestamp: Date.now()
+      });
+      return;
+    }
+    authenticated.ownerUid = targetAuth.ownerUid;
+    authenticated.prePairing = false;
+    authenticated.device = pairedDevice;
+  }
   if ((!targetDevice || !senderDevice.pairing_id || !targetDevice.pairing_id ||
       (pairingId && senderDevice.pairing_id !== pairingId) ||
       senderDevice.pairing_id !== targetDevice.pairing_id) &&
