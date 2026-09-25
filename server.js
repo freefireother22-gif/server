@@ -122,6 +122,13 @@ async function authenticateDevice(deviceId, firebaseToken) {
     }
   }
   if (!ownerUid) {
+    // A Child can connect before the first pairing is complete. It is
+    // already registered under its anonymous Firebase UID, but it cannot
+    // have owner_firebase_uid/pairing_id until the Parent accepts the OTP.
+    // Allow only the PAIR_ACCEPTED handshake in this pre-pairing state.
+    if (device.role === 'child' && !device.pairing_id) {
+      return { uid: decoded.uid, ownerUid: null, prePairing: true, device };
+    }
     const error = new Error('Device has no verified parent subscription owner');
     error.statusCode = 403;
     throw error;
@@ -229,9 +236,15 @@ async function handleIncomingMessage(ws, msg) {
   const targetAuth = socketDeviceAuth.get(targetWs)?.get(targetDeviceId);
   const senderDevice = authenticated.device;
   const targetDevice = targetAuth?.device;
-  if (!targetDevice || !senderDevice.pairing_id || !targetDevice.pairing_id ||
+  const isPairAcceptedHandshake =
+    type === 'PAIR_ACCEPTED' &&
+    authenticated.prePairing === true &&
+    senderDevice.role === 'child' &&
+    targetDevice?.role === 'parent';
+  if ((!targetDevice || !senderDevice.pairing_id || !targetDevice.pairing_id ||
       (pairingId && senderDevice.pairing_id !== pairingId) ||
-      senderDevice.pairing_id !== targetDevice.pairing_id) {
+      senderDevice.pairing_id !== targetDevice.pairing_id) &&
+      !isPairAcceptedHandshake) {
     safeSend(ws, {
       type: 'ERROR',
       error: 'Sender and target devices are not in the same verified pairing',
